@@ -1,0 +1,15 @@
+# Release archives
+*.zip
+
+# OS / editor
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+*~
+.vs/
+.idea/
+
+# Logs and temp
+*.log
+*.tmp
