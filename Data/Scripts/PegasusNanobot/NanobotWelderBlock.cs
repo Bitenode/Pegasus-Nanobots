@@ -649,8 +649,10 @@ namespace Pegasus.Nanobot
             IMySlimBlock weldBlock;
             if (!ResolveWeldBlock(out weldBlock))
             {
+                _partsStarved = false;
+                _supplyRetryCounter = 0;
                 AdvanceQueue();
-                _status = HasTarget(_target) ? Status.MissingComponents : Status.Idle;
+                _status = HasTarget(_target) ? Status.Welding : Status.Idle;
                 PublishStatus();
                 return;
             }
@@ -669,11 +671,29 @@ namespace Pegasus.Nanobot
 
             if (!_creative && !InventoryHelper.CanWeldTarget(weldBlock, _inventory, _creative, _missing))
             {
+                if (!TargetNeedsRepair(_target))
+                {
+                    _partsStarved = false;
+                    _supplyRetryCounter = 0;
+                    AdvanceQueue();
+                    _status = HasTarget(_target) ? Status.Welding : Status.Idle;
+                    PublishStatus();
+                    return;
+                }
+
                 var partsOnLine = InventoryHelper.HasConnectedComponentsAvailable(
                     weldBlock, _inventory, _sources, _missing);
                 _partsStarved = !partsOnLine;
 
-                if (_partsStarved)
+                RefreshInventorySourcesIfNeeded(force: true);
+                TrySupplyComponents(weldBlock, updateStockpile: true);
+
+                if (InventoryHelper.CanWeldTarget(weldBlock, _inventory, _creative, _missing))
+                {
+                    _partsStarved = false;
+                    _supplyRetryCounter = 0;
+                }
+                else
                 {
                     _supplyRetryCounter++;
                     if (_supplyRetryCounter < SupplyRetryInterval)
@@ -683,20 +703,11 @@ namespace Pegasus.Nanobot
                         return;
                     }
 
+                    _partsStarved = false;
                     _supplyRetryCounter = 0;
-                    RefreshInventorySourcesIfNeeded(force: true);
-                    TrySupplyComponents(weldBlock, updateStockpile: false);
-                }
-                else
-                {
-                    RefreshInventorySourcesIfNeeded(force: true);
-                    TrySupplyComponents(weldBlock, updateStockpile: true);
-                }
-
-                if (!InventoryHelper.CanWeldTarget(weldBlock, _inventory, _creative, _missing))
-                {
-                    _status = Status.MissingComponents;
-                    PublishStatus(throttle: _partsStarved);
+                    AdvanceQueue();
+                    _status = HasTarget(_target) ? Status.Welding : Status.Idle;
+                    PublishStatus();
                     return;
                 }
             }

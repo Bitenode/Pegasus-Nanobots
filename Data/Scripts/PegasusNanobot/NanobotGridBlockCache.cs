@@ -77,6 +77,7 @@ namespace Pegasus.Nanobot
                 var cached = blocks[i];
                 var block = cached.Block;
                 if (block == null || block.IsDestroyed) continue;
+                if (!NeedsRepair(block)) continue;
                 if (block.FatBlock != null && block.FatBlock == welder) continue;
                 if (shouldInclude != null && !shouldInclude(block)) continue;
 
