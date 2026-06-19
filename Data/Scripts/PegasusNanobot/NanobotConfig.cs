@@ -1,6 +1,7 @@
 namespace Pegasus.Nanobot
 {
     using System;
+    using System.Collections.Generic;
     using System.Text;
 
     public sealed class NanobotConfig
@@ -13,9 +14,14 @@ namespace Pegasus.Nanobot
         public const int DefaultMaxScanBuffer = 80;
         public const int DefaultProjectionScanBlocks = 8;
         public const int MaxScanBufferLimit = 200;
+        public const float DefaultWeldSpeed = 1f;
+        public const float MinWeldSpeed = 0.25f;
+        public const float MaxWeldSpeed = 4f;
         public const string StatusMarker = "---status---";
 
         public float Range = DefaultRange;
+        public float WeldSpeed = DefaultWeldSpeed;
+        public bool ScanUnloadedGrids;
         public bool ScanOwnGridOnly;
         public bool FactionOnly;
         public bool RepairProjections = true;
@@ -28,6 +34,12 @@ namespace Pegasus.Nanobot
         public bool ForceReset;
         public string LcdMode = "detail";
         public int WelderId;
+        public NanobotRepairMode RepairMode = NanobotRepairMode.FunctionalFirst;
+        public string PriorityBlocks = string.Empty;
+        public string IgnoreBlocks = string.Empty;
+
+        public readonly List<string> PriorityBlockKeywords = new List<string>();
+        public readonly List<string> IgnoreBlockKeywords = new List<string>();
 
         public string UserConfigSection { get; private set; } = DefaultConfigHeader();
 
@@ -37,6 +49,8 @@ namespace Pegasus.Nanobot
                 + "Range=250\nFactionOnly=false\nScanOwnGridOnly=false\n"
                 + "UseConnectors=true\nConnectorHops=2\nRepairProjections=true\nGridsPerScan=5\n"
                 + "LowPowerMode=true\nMaxScanBuffer=80\nProjectionScanBlocks=8\n"
+                + "WeldSpeed=1\nScanUnloadedGrids=false\n"
+                + "RepairMode=FunctionalFirst\nPriorityBlocks=\nIgnoreBlocks=\n"
                 + "LcdMode=detail\nWelderId=0";
         }
 
@@ -52,9 +66,14 @@ namespace Pegasus.Nanobot
             GridsPerScan = DefaultGridsPerScan;
             MaxScanBuffer = DefaultMaxScanBuffer;
             ProjectionScanBlocks = DefaultProjectionScanBlocks;
+            WeldSpeed = DefaultWeldSpeed;
+            ScanUnloadedGrids = false;
             ForceReset = false;
             LcdMode = "detail";
             WelderId = 0;
+            RepairMode = NanobotRepairMode.FunctionalFirst;
+            PriorityBlocks = string.Empty;
+            IgnoreBlocks = string.Empty;
 
             if (string.IsNullOrWhiteSpace(customData))
             {
@@ -98,6 +117,13 @@ namespace Pegasus.Nanobot
                 ProjectionScanBlocks = 1;
             if (ProjectionScanBlocks > NanobotProjectionHelper.MaxBlocksPerProjectorScan)
                 ProjectionScanBlocks = NanobotProjectionHelper.MaxBlocksPerProjectorScan;
+            if (WeldSpeed < MinWeldSpeed)
+                WeldSpeed = MinWeldSpeed;
+            if (WeldSpeed > MaxWeldSpeed)
+                WeldSpeed = MaxWeldSpeed;
+
+            NanobotRepairPriority.ParseKeywordList(PriorityBlocks, PriorityBlockKeywords);
+            NanobotRepairPriority.ParseKeywordList(IgnoreBlocks, IgnoreBlockKeywords);
         }
 
         public string FormatCustomData(string statusBody)
@@ -206,6 +232,20 @@ namespace Pegasus.Nanobot
                 return;
             }
 
+            if (key.Equals("WeldSpeed", StringComparison.OrdinalIgnoreCase))
+            {
+                float parsed;
+                if (float.TryParse(value, out parsed))
+                    WeldSpeed = parsed;
+                return;
+            }
+
+            if (key.Equals("ScanUnloadedGrids", StringComparison.OrdinalIgnoreCase))
+            {
+                ScanUnloadedGrids = ParseBool(value);
+                return;
+            }
+
             if (key.Equals("ForceReset", StringComparison.OrdinalIgnoreCase))
             {
                 ForceReset = ParseBool(value);
@@ -224,6 +264,24 @@ namespace Pegasus.Nanobot
                 int parsed;
                 if (int.TryParse(value, out parsed) && parsed >= 0)
                     WelderId = parsed;
+                return;
+            }
+
+            if (key.Equals("RepairMode", StringComparison.OrdinalIgnoreCase))
+            {
+                RepairMode = NanobotRepairPriority.ParseMode(value);
+                return;
+            }
+
+            if (key.Equals("PriorityBlocks", StringComparison.OrdinalIgnoreCase))
+            {
+                PriorityBlocks = value ?? string.Empty;
+                return;
+            }
+
+            if (key.Equals("IgnoreBlocks", StringComparison.OrdinalIgnoreCase))
+            {
+                IgnoreBlocks = value ?? string.Empty;
             }
         }
 

@@ -14,14 +14,22 @@ namespace Pegasus.Nanobot
             public int WelderConfigId;
             public int StatusCode;
             public int LastSeenTick;
+            public string MissingParts;
         }
 
         private static readonly List<Entry> Entries = new List<Entry>();
         private static int _globalTick;
 
-        public static void Update(long welderEntityId, long gridId, int welderConfigId, int statusCode)
+        public static void Update(
+            long welderEntityId,
+            long gridId,
+            int welderConfigId,
+            int statusCode,
+            string missingParts)
         {
             var tick = ++_globalTick;
+            if (missingParts == null)
+                missingParts = string.Empty;
 
             for (int i = 0; i < Entries.Count; i++)
             {
@@ -32,6 +40,7 @@ namespace Pegasus.Nanobot
                 entry.WelderConfigId = welderConfigId;
                 entry.StatusCode = statusCode;
                 entry.LastSeenTick = tick;
+                entry.MissingParts = missingParts;
                 Entries[i] = entry;
                 return;
             }
@@ -42,7 +51,8 @@ namespace Pegasus.Nanobot
                 GridId = gridId,
                 WelderConfigId = welderConfigId,
                 StatusCode = statusCode,
-                LastSeenTick = tick
+                LastSeenTick = tick,
+                MissingParts = missingParts
             });
         }
 
@@ -105,6 +115,103 @@ namespace Pegasus.Nanobot
             if (off > 0) sb.Append("Off: ").Append(off).Append('\n');
             if (other > 0) sb.Append("Other: ").Append(other).Append('\n');
             return sb.ToString().TrimEnd();
+        }
+
+        public static string BuildSupplySummary(long gridId)
+        {
+            var totals = new Dictionary<string, int>();
+            var starvedWelders = 0;
+
+            for (int i = 0; i < Entries.Count; i++)
+            {
+                var entry = Entries[i];
+                if (entry.GridId != gridId) continue;
+                if (entry.StatusCode != 2) continue;
+
+                starvedWelders++;
+                if (string.IsNullOrEmpty(entry.MissingParts)) continue;
+
+                var parts = entry.MissingParts.Split(';');
+                for (int p = 0; p < parts.Length; p++)
+                {
+                    var part = parts[p];
+                    if (part.Length == 0) continue;
+
+                    var colon = part.IndexOf(':');
+                    if (colon <= 0) continue;
+
+                    var name = part.Substring(0, colon);
+                    int amount;
+                    if (!int.TryParse(part.Substring(colon + 1), out amount) || amount <= 0)
+                        continue;
+
+                    int existing;
+                    if (totals.TryGetValue(name, out existing))
+                        totals[name] = existing + amount;
+                    else
+                        totals[name] = amount;
+                }
+            }
+
+            if (starvedWelders == 0)
+                return "Nanobot Supply\nAll welders stocked";
+
+            var sb = new StringBuilder(256);
+            sb.Append("Nanobot Supply (").Append(starvedWelders).Append(" starved)\n");
+
+            foreach (var pair in totals)
+                sb.Append("  ").Append(pair.Key).Append(": ").Append(pair.Value).Append('\n');
+
+            if (totals.Count == 0)
+                sb.Append("  (waiting for parts)\n");
+
+            return sb.ToString().TrimEnd();
+        }
+
+        public static bool HasStarvedWelders(long gridId)
+        {
+            for (int i = 0; i < Entries.Count; i++)
+            {
+                var entry = Entries[i];
+                if (entry.GridId == gridId && entry.StatusCode == 2)
+                    return true;
+            }
+
+            return false;
+        }
+
+        public static void CollectMissingParts(long gridId, Dictionary<string, int> totals)
+        {
+            totals.Clear();
+
+            for (int i = 0; i < Entries.Count; i++)
+            {
+                var entry = Entries[i];
+                if (entry.GridId != gridId) continue;
+                if (entry.StatusCode != 2) continue;
+                if (string.IsNullOrEmpty(entry.MissingParts)) continue;
+
+                var parts = entry.MissingParts.Split(';');
+                for (int p = 0; p < parts.Length; p++)
+                {
+                    var part = parts[p];
+                    if (part.Length == 0) continue;
+
+                    var colon = part.IndexOf(':');
+                    if (colon <= 0) continue;
+
+                    var name = part.Substring(0, colon);
+                    int amount;
+                    if (!int.TryParse(part.Substring(colon + 1), out amount) || amount <= 0)
+                        continue;
+
+                    int existing;
+                    if (totals.TryGetValue(name, out existing))
+                        totals[name] = existing + amount;
+                    else
+                        totals[name] = amount;
+                }
+            }
         }
     }
 }

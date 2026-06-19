@@ -3,5 +3,9 @@
    <BlueprintClassEntries>
       <Entry Class="LargeBlocks" BlueprintSubtypeId="ShipWelder/SELtdLargeNanobotBuildAndRepairSystem" />
       <Entry Class="SmallBlocks" BlueprintSubtypeId="ShipWelder/SELtdSmallNanobotBuildAndRepairSystem" />
+      <Entry Class="LargeBlocks" BlueprintSubtypeId="TextPanel/PegasusAssemblerLinkLarge" />
+      <Entry Class="SmallBlocks" BlueprintSubtypeId="TextPanel/PegasusAssemblerLinkSmall" />
+      <Entry Class="LargeBlocks" BlueprintSubtypeId="ShipConnector/PegasusDockDoctorLarge" />
+      <Entry Class="SmallBlocks" BlueprintSubtypeId="ShipConnector/PegasusDockDoctorSmall" />
    </BlueprintClassEntries>
 </Definitions>

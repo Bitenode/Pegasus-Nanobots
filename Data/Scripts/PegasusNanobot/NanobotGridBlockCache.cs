@@ -39,7 +39,8 @@ namespace Pegasus.Nanobot
             int damagedCountCap,
             ref int damagedInRange,
             List<WeldTarget> scanBuffer,
-            bool lowPowerMode)
+            bool lowPowerMode,
+            System.Func<IMySlimBlock, bool> shouldInclude = null)
         {
             if (grid == null || grid.Closed || scanBuffer == null) return;
 
@@ -52,7 +53,8 @@ namespace Pegasus.Nanobot
             if (entryIndex >= 0)
             {
                 var entry = Entries[entryIndex];
-                if (tick - entry.Tick < ttl && entry.Blocks != null)
+                var cacheValid = entry.Blocks != null && tick - entry.Tick < ttl;
+                if (cacheValid)
                 {
                     entry.LastUsed = tick;
                     Entries[entryIndex] = entry;
@@ -76,6 +78,7 @@ namespace Pegasus.Nanobot
                 var block = cached.Block;
                 if (block == null || block.IsDestroyed) continue;
                 if (block.FatBlock != null && block.FatBlock == welder) continue;
+                if (shouldInclude != null && !shouldInclude(block)) continue;
 
                 if (Vector3D.DistanceSquared(cached.WorldCenter, welderPos) > rangeSq) continue;
 

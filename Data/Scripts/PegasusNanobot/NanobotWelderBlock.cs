@@ -18,7 +18,7 @@ namespace Pegasus.Nanobot
         "SELtdLargeNanobotBuildAndRepairSystem", "SELtdSmallNanobotBuildAndRepairSystem")]
     public class NanobotWelderBlock : MyGameLogicComponent
     {
-        public const string Version = "1.0.10";
+        public const string Version = "1.1.0";
 
         private const float WeldIntegrityFractionPerTick = 0.016f;
         private const float MaxBoneMovement = 0.04f;
@@ -117,7 +117,7 @@ namespace Pegasus.Nanobot
 
             _inventory = _welder.GetInventory(0);
             _scanPhaseOffset = (int)(Entity.EntityId % ScanIntervalIdle);
-            _scanCounter = _scanPhaseOffset;
+            _scanCounter = int.MaxValue / 2;
             _healthResetCounter = (int)(Entity.EntityId % HealthResetUpdates);
             _tickStaggerPhase = (int)(Entity.EntityId % 3);
             _homeGridId = _welder.CubeGrid?.EntityId ?? 0;
@@ -129,9 +129,12 @@ namespace Pegasus.Nanobot
                 : MyEntityUpdateEnum.EACH_10TH_FRAME;
             _lastParsedConfigSection = ExtractConfigSection(_terminal.CustomData ?? string.Empty);
             RefreshInventorySourcesIfNeeded(force: true);
-            RefreshLcdPanels(force: true);
             _status = Status.Idle;
+            RefreshLcdPanels(force: true);
             PublishStatus(force: true);
+            var grid = _welder.CubeGrid;
+            if (grid != null)
+                NanobotGridLcd.UpdateSharedPanels(grid, NanobotGridLcd.NextTick());
         }
 
         public override void Close()
@@ -160,7 +163,7 @@ namespace Pegasus.Nanobot
                 NeedsUpdate = MyEntityUpdateEnum.EACH_10TH_FRAME;
 
             _tickStaggerCounter++;
-            if (ShouldSkipStaggeredTick()) return;
+            var skipUiTick = ShouldSkipStaggeredTick();
 
             EnsureBlockReferences();
             if (_welder == null || _welder.Closed || _welder.CubeGrid == null) return;
@@ -179,11 +182,17 @@ namespace Pegasus.Nanobot
 
             ReloadConfigIfChanged();
 
-            _lcdRefreshCounter++;
-            if (_lcdRefreshCounter >= GetEffectiveLcdRefreshInterval())
+            if (!skipUiTick)
             {
-                _lcdRefreshCounter = 0;
-                RefreshLcdPanels(force: true);
+                _lcdRefreshCounter++;
+                if (_lcdRefreshCounter >= GetEffectiveLcdRefreshInterval())
+                {
+                    _lcdRefreshCounter = 0;
+                    RefreshLcdPanels(force: true);
+                    var grid = _welder.CubeGrid;
+                    if (grid != null)
+                        NanobotGridLcd.UpdateSharedPanels(grid, NanobotGridLcd.NextTick());
+                }
             }
 
             var scanInterval = GetScanInterval();
@@ -216,6 +225,8 @@ namespace Pegasus.Nanobot
         private bool ShouldSkipStaggeredTick()
         {
             if (NeedsUpdate != MyEntityUpdateEnum.EACH_100TH_FRAME) return false;
+            if (_status == Status.Welding || _status == Status.MissingComponents) return false;
+            if (HasTarget(_target) || _queue.Count > 0 || _damagedInRange > 0) return false;
             return (_tickStaggerCounter % 3) != _tickStaggerPhase;
         }
 
@@ -285,6 +296,19 @@ namespace Pegasus.Nanobot
 
         private int GetScanInterval()
         {
+            NanobotRepairMode boostMode;
+            bool fastScan;
+            var gridId = _welder.CubeGrid?.EntityId ?? 0;
+            if (gridId != 0
+                && NanobotDockDoctorRegistry.TryGetBoost(gridId, out boostMode, out fastScan)
+                && fastScan)
+            {
+                if (_partsStarved)
+                    return ScanIntervalIdleEmpty;
+                if (HasTarget(_target) && _status != Status.MissingComponents) return ScanIntervalActive;
+                return ScanIntervalIdle;
+            }
+
             if (_partsStarved)
                 return _lowPowerIdleThrottle ? ScanIntervalIdleEmptyLowPower : ScanIntervalIdleEmpty;
             if (HasTarget(_target) && _status != Status.MissingComponents) return ScanIntervalActive;
@@ -371,6 +395,7 @@ namespace Pegasus.Nanobot
 
             _healthResetCounter = 0;
             NanobotFleetRegistry.PruneStale();
+            NanobotDockDoctorRegistry.Tick();
             _forceInventoryRefresh = true;
             RefreshInventorySourcesIfNeeded(force: true);
             PurgeInvalidQueueEntries();
@@ -411,7 +436,9 @@ namespace Pegasus.Nanobot
         private bool IsWelderPowered()
         {
             if (_creative) return true;
-            return _welder.IsWorking;
+            // Custom script welds for nanobots; vanilla IsWorking stays false when HelpOthers
+            // is off and SensorRadius is near zero, so rely on enabled + functional instead.
+            return _welder.Enabled && _welder.IsFunctional;
         }
 
         private void ReloadConfigIfChanged()
@@ -628,6 +655,16 @@ namespace Pegasus.Nanobot
                 return;
             }
 
+            var targetGrid = weldBlock.CubeGrid;
+            if (targetGrid == null || targetGrid.Closed
+                || (!_config.ScanUnloadedGrids && targetGrid.Physics == null))
+            {
+                AdvanceQueue();
+                _status = HasTarget(_target) ? Status.Welding : Status.Idle;
+                PublishStatus();
+                return;
+            }
+
             TrySupplyComponents(weldBlock, updateStockpile: true);
 
             if (!_creative && !InventoryHelper.CanWeldTarget(weldBlock, _inventory, _creative, _missing))
@@ -667,7 +704,7 @@ namespace Pegasus.Nanobot
             _partsStarved = false;
             _supplyRetryCounter = 0;
 
-            var speed = MyAPIGateway.Session.WelderSpeedMultiplier;
+            var speed = MyAPIGateway.Session.WelderSpeedMultiplier * _config.WeldSpeed;
             var weldAmount = weldBlock.MaxIntegrity * WeldIntegrityFractionPerTick * speed;
             var remaining = weldBlock.MaxIntegrity - weldBlock.Integrity;
             if (remaining > 0f && weldAmount > remaining)
@@ -820,7 +857,8 @@ namespace Pegasus.Nanobot
                 DamagedCountCap,
                 ref _damagedInRange,
                 _scanBuffer,
-                _config.LowPowerMode);
+                _config.LowPowerMode,
+                ShouldIncludeBlock);
 
             if (_config.RepairProjections && ShouldScanProjections())
             {
@@ -870,6 +908,23 @@ namespace Pegasus.Nanobot
             }
         }
 
+        private bool ShouldIncludeBlock(IMySlimBlock block)
+        {
+            if (block == null) return false;
+            return !NanobotRepairPriority.IsIgnored(block, _config.IgnoreBlockKeywords);
+        }
+
+        private NanobotRepairMode GetEffectiveRepairMode()
+        {
+            var gridId = _welder.CubeGrid?.EntityId ?? 0;
+            NanobotRepairMode boostMode;
+            bool fastScan;
+            if (gridId != 0 && NanobotDockDoctorRegistry.TryGetBoost(gridId, out boostMode, out fastScan))
+                return boostMode;
+
+            return _config.RepairMode;
+        }
+
         private int CompareRepairPriority(WeldTarget a, WeldTarget b)
         {
             if (!HasTarget(a) && !HasTarget(b)) return 0;
@@ -878,6 +933,12 @@ namespace Pegasus.Nanobot
 
             var aBlock = a.Block ?? a.Projected;
             var bBlock = b.Block ?? b.Projected;
+
+            var repairMode = GetEffectiveRepairMode();
+            var aScore = NanobotRepairPriority.GetPriorityScore(aBlock, repairMode, _config.PriorityBlockKeywords);
+            var bScore = NanobotRepairPriority.GetPriorityScore(bBlock, repairMode, _config.PriorityBlockKeywords);
+            if (aScore != bScore) return aScore.CompareTo(bScore);
+
             var aDef = aBlock != null && aBlock.HasDeformation ? 0 : 1;
             var bDef = bBlock != null && bBlock.HasDeformation ? 0 : 1;
             if (aDef != bDef) return aDef.CompareTo(bDef);
@@ -892,7 +953,8 @@ namespace Pegasus.Nanobot
 
         private bool IsGridAllowed(IMyCubeGrid grid)
         {
-            if (grid == null) return false;
+            if (grid == null || grid.Closed || grid.MarkedForClose) return false;
+            if (!_config.ScanUnloadedGrids && grid.Physics == null) return false;
             if (_config.ScanOwnGridOnly && grid != _welder.CubeGrid) return false;
 
             if (!_config.FactionOnly)
@@ -964,7 +1026,41 @@ namespace Pegasus.Nanobot
         private void UpdateFleetRegistry()
         {
             var gridId = _welder.CubeGrid?.EntityId ?? 0;
-            NanobotFleetRegistry.Update(Entity.EntityId, gridId, _config.WelderId, ToFleetStatusCode(_status));
+            NanobotFleetRegistry.Update(
+                Entity.EntityId,
+                gridId,
+                _config.WelderId,
+                ToFleetStatusCode(_status),
+                BuildMissingPartsSummary());
+        }
+
+        private string BuildMissingPartsSummary()
+        {
+            if (_status != Status.MissingComponents)
+                return string.Empty;
+
+            _missing.Clear();
+            if (HasTarget(_target))
+            {
+                var weldBlock = _target.Block ?? _target.Projected;
+                if (weldBlock != null)
+                    weldBlock.GetMissingComponents(_missing);
+            }
+
+            if (_missing.Count == 0)
+                return string.Empty;
+
+            var sb = new StringBuilder(128);
+            var first = true;
+            foreach (var entry in _missing)
+            {
+                if (entry.Value <= 0) continue;
+                if (!first) sb.Append(';');
+                sb.Append(entry.Key).Append(':').Append(entry.Value);
+                first = false;
+            }
+
+            return sb.ToString();
         }
 
         private static int ToFleetStatusCode(Status status)
@@ -1007,11 +1103,6 @@ namespace Pegasus.Nanobot
                 return statusBody + "\nRepaired: " + _blocksRepaired + "\nQueue: " + _queue.Count;
             if (mode == "alert")
                 return _status == Status.MissingComponents ? statusBody : string.Empty;
-            if (mode == "fleet")
-            {
-                var gridId = _welder.CubeGrid?.EntityId ?? 0;
-                return NanobotFleetRegistry.BuildFleetSummary(gridId);
-            }
 
             return statusBody;
         }
@@ -1108,7 +1199,10 @@ namespace Pegasus.Nanobot
                 _text.Append("Sources: ").Append(_sources.Count);
                 _text.Append(" inv / ").Append(_sourceGridCount).Append(" grids");
                 _text.Append(" | Queue: ").Append(_queue.Count).Append('\n');
-                _text.Append("Range: ").Append((int)_config.Range).Append("m\n");
+                _text.Append("Range: ").Append((int)_config.Range).Append("m");
+                if (GetEffectiveRepairMode() != NanobotRepairMode.Nearest)
+                    _text.Append(" | Repair: ").Append(_config.RepairMode);
+                _text.Append('\n');
             }
         }
 
@@ -1365,62 +1459,22 @@ namespace Pegasus.Nanobot
                 if (string.IsNullOrEmpty(name))
                     name = panel.DisplayNameText ?? string.Empty;
 
-                if (name.IndexOf(LcdNameTag, StringComparison.OrdinalIgnoreCase) < 0)
+                if (name.IndexOf(NanobotLcdTagParser.LcdNameTag, StringComparison.OrdinalIgnoreCase) < 0)
                     continue;
 
                 int panelWelderId;
                 string panelMode;
-                if (!TryParseLcdTag(name, out panelWelderId, out panelMode))
+                if (!NanobotLcdTagParser.TryParse(name, out panelWelderId, out panelMode))
                     continue;
 
                 if (panelWelderId != 0 && panelWelderId != _config.WelderId)
                     continue;
 
+                if (NanobotLcdTagParser.IsSharedGridMode(panelMode))
+                    continue;
+
                 _lcdPanels.Add(new LcdBinding { Panel = panel, Mode = panelMode });
             }
-        }
-
-        private static bool TryParseLcdTag(string name, out int welderId, out string mode)
-        {
-            welderId = 0;
-            mode = string.Empty;
-
-            var start = name.IndexOf(LcdNameTag, StringComparison.OrdinalIgnoreCase);
-            if (start < 0) return false;
-
-            var end = name.IndexOf(']', start);
-            if (end < 0) return true;
-
-            var inner = name.Substring(start + LcdNameTag.Length, end - start - LcdNameTag.Length);
-            if (inner.StartsWith(":", StringComparison.Ordinal))
-                inner = inner.Substring(1);
-
-            if (inner.Length == 0) return true;
-
-            var parts = inner.Split(':');
-            for (int i = 0; i < parts.Length; i++)
-            {
-                var part = parts[i].Trim();
-                if (part.Length == 0) continue;
-
-                int id;
-                if (int.TryParse(part, out id))
-                {
-                    welderId = id;
-                    continue;
-                }
-
-                if (part.Equals("all", StringComparison.OrdinalIgnoreCase)
-                    || part.Equals("*", StringComparison.Ordinal))
-                {
-                    welderId = 0;
-                    continue;
-                }
-
-                mode = part.ToLowerInvariant();
-            }
-
-            return true;
         }
 
         private void TrySupplyComponents(IMySlimBlock target, bool updateStockpile)
