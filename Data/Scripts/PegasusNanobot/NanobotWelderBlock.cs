@@ -20,7 +20,7 @@ namespace Pegasus.Nanobot
     {
         public const string Version = "1.1.0";
 
-        private const float WeldIntegrityFractionPerTick = 0.016f;
+        private const float WeldIntegrityFractionPerTick = 0.019f;
         private const float MaxBoneMovement = 0.04f;
         private const string LcdNameTag = "[NB";
         private const int MaxQueueSize = 10;
@@ -37,7 +37,9 @@ namespace Pegasus.Nanobot
         private const int CustomDataWriteInterval = 6;
         private const int CustomDataWriteIntervalLowPower = 12;
         private const int StuckWarningUpdates = 1800;
-        private const int ScanCacheRefreshScans = 6;
+        private const int ScanCacheRefreshScans = 12;
+        private const int GridListRefreshCycles = 2;
+        private const int ActiveWorkGraceTicks = 30;
         private const int InventoryRefreshScanInterval = 4;
         private const int SupplyRetryInterval = 24;
         private const int StarvedPublishInterval = 18;
@@ -96,6 +98,9 @@ namespace Pegasus.Nanobot
         private Status _lastPublishedStatus = Status.Initializing;
         private long _lastPublishedTargetKey;
         private bool _lowPowerIdleThrottle;
+        private bool _deferBlockScanAfterRebuild;
+        private int _gridListRefreshCounter;
+        private int _activeWorkGraceTicks;
 
         private struct LcdBinding
         {
@@ -167,13 +172,15 @@ namespace Pegasus.Nanobot
 
             EnsureBlockReferences();
             if (_welder == null || _welder.Closed || _welder.CubeGrid == null) return;
-            if (MyAPIGateway.Session == null || !MyAPIGateway.Session.IsServer) return;
+            if (!ShouldRunServerLogic()) return;
+
+            _creative = IsCreativeSession();
 
             UpdateLowPowerIdleThrottle();
 
             if (_inventory == null)
                 _inventory = _welder.GetInventory(0);
-            if (_inventory == null) return;
+            if (!_creative && _inventory == null) return;
 
             CheckGridChanged();
             TickErrorRecovery();
@@ -232,42 +239,49 @@ namespace Pegasus.Nanobot
 
         private void UpdateLowPowerIdleThrottle()
         {
-            if (!_config.LowPowerMode)
+            if (_creative || !_config.LowPowerMode)
             {
                 _lowPowerIdleThrottle = false;
                 return;
             }
 
-            if (_partsStarved)
+            if (HasActiveWork())
             {
-                _lowPowerIdleThrottle = true;
+                _lowPowerIdleThrottle = false;
                 return;
             }
 
-            var wantSlow = !CanOperate()
-                || (_status == Status.Idle && _damagedInRange == 0 && !HasTarget(_target));
+            // Stay responsive while a scan cycle is in progress (damaged count may reset mid-pass).
+            if (_scanCacheTicks > 0 || _deferBlockScanAfterRebuild)
+            {
+                _lowPowerIdleThrottle = false;
+                return;
+            }
 
-            if (_status == Status.Welding || HasTarget(_target))
-                wantSlow = false;
-            if (_status == Status.MissingComponents)
-                wantSlow = true;
-            if (_damagedInRange > 0 && _status != Status.Off && _status != Status.Damaged && _status != Status.MissingComponents)
-                wantSlow = false;
+            _lowPowerIdleThrottle = CanOperate()
+                && _status == Status.Idle
+                && !HasTarget(_target)
+                && _queue.Count == 0
+                && _damagedInRange == 0;
+        }
 
-            _lowPowerIdleThrottle = wantSlow;
+        private bool HasActiveWork()
+        {
+            if (_activeWorkGraceTicks > 0) return true;
+            if (HasTarget(_target) || _queue.Count > 0) return true;
+            if (_status == Status.Welding || _status == Status.MissingComponents) return true;
+            if (_damagedInRange > 0 && _status != Status.Off && _status != Status.Damaged) return true;
+            return false;
+        }
+
+        private void MarkActiveWork()
+        {
+            _activeWorkGraceTicks = ActiveWorkGraceTicks;
         }
 
         private void ApplyAdaptiveUpdateRate()
         {
-            if (_partsStarved)
-            {
-                if (NeedsUpdate != MyEntityUpdateEnum.EACH_100TH_FRAME)
-                    NeedsUpdate = MyEntityUpdateEnum.EACH_100TH_FRAME;
-                _lowPowerIdleThrottle = true;
-                return;
-            }
-
-            if (!_config.LowPowerMode)
+            if (_creative || !_config.LowPowerMode)
             {
                 if (NeedsUpdate != MyEntityUpdateEnum.EACH_10TH_FRAME)
                     NeedsUpdate = MyEntityUpdateEnum.EACH_10TH_FRAME;
@@ -275,7 +289,10 @@ namespace Pegasus.Nanobot
                 return;
             }
 
-            var wantSlow = _lowPowerIdleThrottle;
+            if (_activeWorkGraceTicks > 0)
+                _activeWorkGraceTicks--;
+
+            var wantSlow = _lowPowerIdleThrottle && !HasActiveWork();
             var desired = wantSlow
                 ? MyEntityUpdateEnum.EACH_100TH_FRAME
                 : MyEntityUpdateEnum.EACH_10TH_FRAME;
@@ -311,9 +328,14 @@ namespace Pegasus.Nanobot
 
             if (_partsStarved)
                 return _lowPowerIdleThrottle ? ScanIntervalIdleEmptyLowPower : ScanIntervalIdleEmpty;
+            if (_creative)
+            {
+                if (HasTarget(_target) && _status != Status.MissingComponents) return ScanIntervalActive;
+                return ScanIntervalIdle;
+            }
             if (HasTarget(_target) && _status != Status.MissingComponents) return ScanIntervalActive;
-            if (_damagedInRange == 0 && _status == Status.Idle)
-                return _lowPowerIdleThrottle ? ScanIntervalIdleEmptyLowPower : ScanIntervalIdleEmpty;
+            if (_damagedInRange == 0 && _status == Status.Idle && !HasTarget(_target))
+                return _lowPowerIdleThrottle ? ScanIntervalIdleEmptyLowPower : ScanIntervalIdle;
             return _lowPowerIdleThrottle ? ScanIntervalIdleLowPower : ScanIntervalIdle;
         }
 
@@ -431,6 +453,21 @@ namespace Pegasus.Nanobot
 
             if (!HasTarget(_target) && _queue.Count > 0)
                 _target = _queue[0];
+        }
+
+        private static bool ShouldRunServerLogic()
+        {
+            if (MyAPIGateway.Session == null) return false;
+
+            var mp = MyAPIGateway.Multiplayer;
+            if (mp == null || !mp.MultiplayerActive) return true;
+
+            return MyAPIGateway.Session.IsServer;
+        }
+
+        private bool IsCreativeSession()
+        {
+            return MyAPIGateway.Session != null && MyAPIGateway.Session.CreativeMode;
         }
 
         private bool IsWelderPowered()
@@ -602,16 +639,19 @@ namespace Pegasus.Nanobot
 
             if (HasTarget(_target) && IsValidTarget(_target) && TargetNeedsRepair(_target))
             {
-                if (!_target.IsProjection)
+                // Top up queue only when nearly empty; skip heavy scans while actively welding.
+                if (!_target.IsProjection && _queue.Count <= 2)
                     RunAreaScan(fillQueue: false);
-                PublishStatus(force: true);
+                PublishStatus();
                 return;
             }
 
             RunAreaScan(fillQueue: true);
             _target = _queue.Count > 0 ? _queue[0] : default(WeldTarget);
             _status = HasTarget(_target) ? Status.Welding : Status.Idle;
-            PublishStatus(force: true);
+            if (HasTarget(_target))
+                MarkActiveWork();
+            PublishStatus();
         }
 
         private void TickWeld()
@@ -667,7 +707,8 @@ namespace Pegasus.Nanobot
                 return;
             }
 
-            TrySupplyComponents(weldBlock, updateStockpile: true);
+            if (!_creative)
+                TrySupplyComponents(weldBlock, updateStockpile: true);
 
             if (!_creative && !InventoryHelper.CanWeldTarget(weldBlock, _inventory, _creative, _missing))
             {
@@ -721,14 +762,15 @@ namespace Pegasus.Nanobot
             if (remaining > 0f && weldAmount > remaining)
                 weldAmount = remaining;
 
-            if (weldAmount > 0f && _inventory != null)
+            if (weldAmount > 0f)
             {
+                MarkActiveWork();
                 weldBlock.IncreaseMountLevel(
                     weldAmount,
                     GetBuilderId(),
                     _inventory,
                     speed * MaxBoneMovement,
-                    false);
+                    _creative);
             }
 
             if (!TargetNeedsRepair(_target))
@@ -751,6 +793,10 @@ namespace Pegasus.Nanobot
         private void RebuildNearbyGridsCache()
         {
             _nearbyGrids.Clear();
+
+            var homeGrid = _welder.CubeGrid;
+            if (homeGrid != null && !homeGrid.Closed && IsGridAllowed(homeGrid))
+                _nearbyGrids.Add(homeGrid);
 
             var welderPos = _welder.GetPosition();
             NanobotSpatialCache.GetNearbyGrids(welderPos, _config.Range, _spatialCacheScratch);
@@ -818,13 +864,51 @@ namespace Pegasus.Nanobot
 
         private void RunAreaScan(bool fillQueue)
         {
-            if (_scanCacheTicks <= 0 || _nearbyGrids.Count == 0)
+            if (_nearbyGrids.Count == 0)
             {
                 RebuildNearbyGridsCache();
                 _scanGridCursor = 0;
                 _scanCacheTicks = ScanCacheRefreshScans;
                 _scanBuffer.Clear();
                 _damagedInRange = 0;
+                _gridListRefreshCounter = 0;
+                if (_nearbyGrids.Count == 0)
+                {
+                    if (fillQueue)
+                        _queue.Clear();
+                    return;
+                }
+            }
+
+            if (_deferBlockScanAfterRebuild)
+            {
+                _deferBlockScanAfterRebuild = false;
+            }
+            else if (_scanCacheTicks <= 0)
+            {
+                _scanGridCursor = 0;
+                _scanCacheTicks = ScanCacheRefreshScans;
+                _scanBuffer.Clear();
+                _damagedInRange = 0;
+
+                if (!_creative && ++_gridListRefreshCounter >= GridListRefreshCycles)
+                {
+                    _gridListRefreshCounter = 0;
+                    RebuildNearbyGridsCache();
+                    if (_nearbyGrids.Count == 0)
+                    {
+                        if (fillQueue)
+                            _queue.Clear();
+                        return;
+                    }
+                }
+
+                if (!_creative)
+                {
+                    // Spread spatial rebuild and block scan across ticks to avoid idle lag spikes.
+                    _deferBlockScanAfterRebuild = true;
+                    return;
+                }
             }
 
             _scanCacheTicks--;
@@ -868,7 +952,7 @@ namespace Pegasus.Nanobot
                 DamagedCountCap,
                 ref _damagedInRange,
                 _scanBuffer,
-                _config.LowPowerMode,
+                _config.LowPowerMode && !_creative,
                 ShouldIncludeBlock);
 
             if (_config.RepairProjections && ShouldScanProjections())
@@ -1402,9 +1486,9 @@ namespace Pegasus.Nanobot
             if (block.CubeGrid == null) return false;
             if (!IsGridAllowed(block.CubeGrid)) return false;
 
-            var distSq = Vector3D.DistanceSquared(
-                block.CubeGrid.GridIntegerToWorld(block.Position),
-                _welder.GetPosition());
+            Vector3D blockPos;
+            block.ComputeWorldCenter(out blockPos);
+            var distSq = Vector3D.DistanceSquared(blockPos, _welder.GetPosition());
             var rangeSq = (double)_config.Range * _config.Range;
             return distSq <= rangeSq;
         }
@@ -1447,6 +1531,10 @@ namespace Pegasus.Nanobot
                 if (owners != null && owners.Count > 0)
                     return owners[0];
             }
+
+            var player = MyAPIGateway.Session?.Player;
+            if (player != null && player.IdentityId != 0)
+                return player.IdentityId;
 
             return 0;
         }
